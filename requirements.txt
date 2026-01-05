@@ -2,8 +2,6 @@ fastapi
 uvicorn
 requests
 python-multipart
-openai-whisper
-torch
 ffmpeg-python
 
 
