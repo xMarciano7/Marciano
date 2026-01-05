@@ -87,7 +87,7 @@ def ffprobe_duration(path: str) -> float:
 def pod_transcribe_words(wav_path: str):
     with open(wav_path, "rb") as f:
         files = {"file": f}
-        r = requests.post(RUNPOD_POD_URL, files=files, timeout=900)
+        r = requests.post(os.environ["RUNPOD_POD_URL"], files=files, timeout=900)
     r.raise_for_status()
     data = r.json()
     # Esperado: {"words":[{"word":"hola","start":1.23,"end":1.56}, ...]}
