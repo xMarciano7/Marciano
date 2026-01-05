@@ -1,10 +1,9 @@
 import os
 import uuid
 import json
-import time
 import shutil
-import requests
 import subprocess
+import requests
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse, FileResponse
 
@@ -22,23 +21,17 @@ os.makedirs(STORAGE_INPUT, exist_ok=True)
 os.makedirs(STORAGE_OUTPUT, exist_ok=True)
 os.makedirs(STORAGE_TMP, exist_ok=True)
 
-RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
-RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
+# RunPod POD (no serverless)
+RUNPOD_POD_URL = os.getenv("RUNPOD_POD_URL")  # ej: http://IP:8000/transcribe
 
-if not RUNPOD_API_KEY or not RUNPOD_ENDPOINT_ID:
-    raise RuntimeError("RUNPOD_API_KEY o RUNPOD_ENDPOINT_ID no definidos")
-
-RUNPOD_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}/runsync"
-RUNPOD_HEADERS = {
-    "Authorization": f"Bearer {RUNPOD_API_KEY}",
-    "Content-Type": "application/json",
-}
+if not RUNPOD_POD_URL:
+    raise RuntimeError("RUNPOD_POD_URL no definida")
 
 # ============================================================
 # FASTAPI
 # ============================================================
 
-app = FastAPI(title="ClipFile Backend (RunPod Whisper)")
+app = FastAPI(title="ClipFile Backend (RunPod POD Whisper)")
 
 # ============================================================
 # UTILS
@@ -50,34 +43,19 @@ def write_progress(job_id: str, percent: int):
         json.dump({"percent": percent}, f)
 
 
-def runpod_transcribe(audio_path: str) -> str:
-    import base64
-
+def pod_transcribe(audio_path: str) -> str:
     with open(audio_path, "rb") as f:
-        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
-
-    payload = {
-        "input": {
-            "audio": audio_b64
-        }
-    }
-
-    r = requests.post(
-        RUNPOD_URL,
-        headers=RUNPOD_HEADERS,
-        json=payload,
-        timeout=600
-    )
+        files = {"file": f}
+        r = requests.post(
+            RUNPOD_POD_URL,
+            files=files,
+            timeout=600
+        )
     r.raise_for_status()
-
     data = r.json()
-
-    if "output" not in data or "text" not in data["output"]:
-        raise RuntimeError(f"RunPod response inválida: {data}")
-
-    return data["output"]["text"]
-
-
+    if "text" not in data:
+        raise RuntimeError(f"Respuesta inválida del POD: {data}")
+    return data["text"]
 
 # ============================================================
 # ENDPOINTS
@@ -92,7 +70,6 @@ async def upload_video(file: UploadFile = File(...)):
         shutil.copyfileobj(file.file, f)
 
     write_progress(job_id, 5)
-
     return {"job_id": job_id}
 
 
@@ -113,7 +90,6 @@ def process(job_id: str):
 
     write_progress(job_id, 10)
 
-    # Extraer audio
     audio_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
     subprocess.run(
         [
@@ -132,18 +108,15 @@ def process(job_id: str):
 
     write_progress(job_id, 30)
 
-    # Transcribir con RunPod
-    text = runpod_transcribe(audio_path)
+    text = pod_transcribe(audio_path)
 
     write_progress(job_id, 70)
 
-    # Guardar texto
     txt_path = os.path.join(STORAGE_OUTPUT, f"{job_id}.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write(text)
 
     write_progress(job_id, 100)
-
     return {"status": "ok", "job_id": job_id}
 
 
@@ -157,4 +130,4 @@ def download(job_id: str):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "backend": "runpod-whisper"}
+    return {"status": "ok", "backend": "runpod-pod-whisper"}
