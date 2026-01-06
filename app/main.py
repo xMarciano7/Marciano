@@ -27,7 +27,8 @@ for p in [STORAGE_INPUT, STORAGE_OUTPUT, STORAGE_TMP]:
     os.makedirs(p, exist_ok=True)
 
 # RunPod POD (endpoint HTTP que acepta archivo y devuelve JSON con words)
-RUNPOD_POD_URL = os.getenv("RUNPOD_POD_URL")  # ej: https://xxxx.proxy.runpod.net/xxxxx/transcribe
+RUNPOD_POD_URL = "https://07pz6h3d48z2bo-8000.proxy.runpod.net/transcribe"
+  # ej: https://xxxx.proxy.runpod.net/xxxxx/transcribe
 if not RUNPOD_POD_URL:
     raise RuntimeError("RUNPOD_POD_URL no definida")
 
