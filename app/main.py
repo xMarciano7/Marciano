@@ -1,7 +1,7 @@
 # app/main.py
-# CLIPFILE BACKEND — CLIP AUTOMÁTICO 20–30s + SUBTÍTULOS ASS
-# Whisper corre en RunPod POD (GPU). Render solo coordina.
-# COPIAR Y PEGAR ENTERO.
+# CLIPFILE BACKEND — ASYNC
+# Upload → background process → polling → download
+# Whisper corre en RunPod (GPU). Render NO se bloquea.
 
 import os
 import uuid
@@ -9,7 +9,7 @@ import json
 import shutil
 import subprocess
 import requests
-import math
+import threading
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -26,22 +26,18 @@ STORAGE_TMP = os.path.join(BASE_DIR, "storage", "tmp")
 for p in [STORAGE_INPUT, STORAGE_OUTPUT, STORAGE_TMP]:
     os.makedirs(p, exist_ok=True)
 
-# RunPod POD (endpoint HTTP que acepta archivo y devuelve JSON con words)
-RUNPOD_POD_URL = "https://07pz6h3d48z2bo-8000.proxy.runpod.net/transcribe"
-  # ej: https://xxxx.proxy.runpod.net/xxxxx/transcribe
+RUNPOD_POD_URL = os.getenv("RUNPOD_POD_URL")
 if not RUNPOD_POD_URL:
     raise RuntimeError("RUNPOD_POD_URL no definida")
 
-# Subtítulos / estilo
 FONT_NAME = "Poppins ExtraBold"
 ASS_FONT_SIZE = 110
-ASS_PRIMARY = "&H00FFFF00"   # Amarillo
-ASS_OUTLINE = "&H00000000"   # Negro
+ASS_PRIMARY = "&H00FFFF00"
+ASS_OUTLINE = "&H00000000"
 ASS_OUTLINE_SIZE = 6
-ASS_ALIGN = 5  # centro exacto
+ASS_ALIGN = 5
 MAX_WORDS_ON_SCREEN = 2
 
-# Duración
 MIN_CLIP = 20
 MAX_CLIP = 30
 
@@ -49,20 +45,20 @@ MAX_CLIP = 30
 # FASTAPI
 # ============================================================
 
-app = FastAPI(title="ClipFile Backend — Auto Highlights + Subtitles")
+app = FastAPI(title="ClipFile Backend — ASYNC")
 
 # ============================================================
 # UTILS
 # ============================================================
 
 def run(cmd):
-    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(cmd, check=True)
 
-def write_progress(job_id: str, percent: int):
+def write_progress(job_id, percent):
     with open(os.path.join(STORAGE_TMP, f"{job_id}.progress.json"), "w") as f:
         json.dump({"percent": percent}, f)
 
-def extract_audio(video_path: str, wav_path: str):
+def extract_audio(video_path, wav_path):
     run([
         "ffmpeg", "-y",
         "-i", video_path,
@@ -72,7 +68,7 @@ def extract_audio(video_path: str, wav_path: str):
         wav_path
     ])
 
-def ffprobe_duration(path: str) -> float:
+def ffprobe_duration(path):
     r = subprocess.check_output([
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
@@ -82,22 +78,22 @@ def ffprobe_duration(path: str) -> float:
     return float(r.decode().strip())
 
 # ============================================================
-# RUNPOD — TRANSCRIPCIÓN (WORDS)
+# RUNPOD
 # ============================================================
 
-def pod_transcribe_words(wav_path: str):
+def pod_transcribe_words(wav_path):
     with open(wav_path, "rb") as f:
-        files = {"file": f}
-        r = requests.post(os.environ["RUNPOD_POD_URL"], files=files, timeout=900)
+        r = requests.post(
+            RUNPOD_POD_URL,
+            files={"file": f},
+            timeout=1800
+        )
     r.raise_for_status()
     data = r.json()
-    # Esperado: {"words":[{"word":"hola","start":1.23,"end":1.56}, ...]}
-    if "words" not in data:
-        raise RuntimeError(f"Respuesta POD inválida: {data}")
     return data["words"]
 
 # ============================================================
-# A + B — DETECCIÓN DE MEJOR MOMENTO
+# CLIP LOGIC
 # ============================================================
 
 def score_window(words, start_t, end_t):
@@ -105,20 +101,12 @@ def score_window(words, start_t, end_t):
     for w in words:
         if w["end"] < start_t or w["start"] > end_t:
             continue
-        txt = w["word"].lower()
         score += 1.0
-        if any(x in txt for x in ["ja", "ha", "lol", "laugh"]):
-            score += 3.0
-        if "!" in txt:
-            score += 1.5
-    duration = max(end_t - start_t, 1.0)
-    return score / duration
+    return score / max(end_t - start_t, 1.0)
 
 def pick_best_window(words, total_dur):
     best = (0, MIN_CLIP)
     best_score = -1
-    step = 1.0
-
     for dur in range(MIN_CLIP, MAX_CLIP + 1, 2):
         t = 0.0
         while t + dur <= total_dur:
@@ -126,19 +114,14 @@ def pick_best_window(words, total_dur):
             if s > best_score:
                 best_score = s
                 best = (t, t + dur)
-            t += step
-
+            t += 1.0
     return best
-
-# ============================================================
-# ASS GENERATION
-# ============================================================
 
 def ts_ass(t):
     h = int(t // 3600)
     m = int((t % 3600) // 60)
     s = t % 60
-    return f"{h:d}:{m:02d}:{s:05.2f}"
+    return f"{h}:{m:02d}:{s:05.2f}"
 
 def build_ass(words, clip_start, clip_end, ass_path):
     header = f"""[Script Info]
@@ -154,7 +137,6 @@ Style: Default,{FONT_NAME},{ASS_FONT_SIZE},{ASS_PRIMARY},{ASS_OUTLINE},{ASS_OUTL
 Format: Start, End, Style, Text
 """
     lines = [header]
-
     buf = []
     buf_start = None
 
@@ -169,69 +151,88 @@ Format: Start, End, Style, Text
         buf.append(w["word"])
 
         if len(buf) >= MAX_WORDS_ON_SCREEN:
-            text = " ".join(buf)
-            lines.append(f"Dialogue: {ts_ass(buf_start)},{ts_ass(t1)},Default,{text}\n")
+            lines.append(
+                f"Dialogue: {ts_ass(buf_start)},{ts_ass(t1)},Default,{' '.join(buf)}\n"
+            )
             buf = []
             buf_start = None
 
     if buf and buf_start is not None:
-        lines.append(f"Dialogue: {ts_ass(buf_start)},{ts_ass(clip_end-clip_start)},Default,{' '.join(buf)}\n")
+        lines.append(
+            f"Dialogue: {ts_ass(buf_start)},{ts_ass(clip_end-clip_start)},Default,{' '.join(buf)}\n"
+        )
 
     with open(ass_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+
+# ============================================================
+# BACKGROUND WORKER
+# ============================================================
+
+def process_job(job_id):
+    try:
+        write_progress(job_id, 5)
+
+        input_video = os.path.join(STORAGE_INPUT, f"{job_id}.mp4")
+        wav_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
+
+        extract_audio(input_video, wav_path)
+        write_progress(job_id, 20)
+
+        words = pod_transcribe_words(wav_path)
+        write_progress(job_id, 50)
+
+        total_dur = ffprobe_duration(input_video)
+        clip_start, clip_end = pick_best_window(words, total_dur)
+        write_progress(job_id, 65)
+
+        clip_video = os.path.join(STORAGE_TMP, f"{job_id}_clip.mp4")
+        run([
+            "ffmpeg", "-y",
+            "-ss", str(clip_start),
+            "-to", str(clip_end),
+            "-i", input_video,
+            "-c", "copy",
+            clip_video
+        ])
+
+        ass_path = os.path.join(STORAGE_TMP, f"{job_id}.ass")
+        build_ass(words, clip_start, clip_end, ass_path)
+        write_progress(job_id, 80)
+
+        final_out = os.path.join(STORAGE_OUTPUT, f"{job_id}.mp4")
+        run([
+            "ffmpeg", "-y",
+            "-i", clip_video,
+            "-vf", f"ass={ass_path}:fontsdir=/app/fonts",
+            "-c:a", "copy",
+            final_out
+        ])
+
+        write_progress(job_id, 100)
+
+    except Exception as e:
+        write_progress(job_id, -1)
+        print("JOB ERROR:", job_id, repr(e))
 
 # ============================================================
 # ENDPOINTS
 # ============================================================
 
 @app.post("/upload")
-async def upload_and_process(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...)):
     job_id = str(uuid.uuid4())
 
     input_video = os.path.join(STORAGE_INPUT, f"{job_id}.mp4")
     with open(input_video, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    write_progress(job_id, 5)
+    write_progress(job_id, 1)
 
-    wav_path = os.path.join(STORAGE_TMP, f"{job_id}.wav")
-    extract_audio(input_video, wav_path)
-    write_progress(job_id, 20)
+    t = threading.Thread(target=process_job, args=(job_id,))
+    t.start()
 
-    words = pod_transcribe_words(wav_path)
-    write_progress(job_id, 45)
-
-    total_dur = ffprobe_duration(input_video)
-    clip_start, clip_end = pick_best_window(words, total_dur)
-    write_progress(job_id, 60)
-
-    clip_video = os.path.join(STORAGE_TMP, f"{job_id}_clip.mp4")
-    run([
-        "ffmpeg", "-y",
-        "-ss", str(clip_start),
-        "-to", str(clip_end),
-        "-i", input_video,
-        "-c", "copy",
-        clip_video
-    ])
-
-    ass_path = os.path.join(STORAGE_TMP, f"{job_id}.ass")
-    build_ass(words, clip_start, clip_end, ass_path)
-    write_progress(job_id, 75)
-
-    final_out = os.path.join(STORAGE_OUTPUT, f"{job_id}.mp4")
-    run([
-        "ffmpeg", "-y",
-        "-i", clip_video,
-        "-vf", f"ass={ass_path}:fontsdir=/app/fonts",
-        "-c:a", "copy",
-        final_out
-    ])
-
-
-    write_progress(job_id, 100)
-
-    return {"job_id": job_id, "clip_start": clip_start, "clip_end": clip_end}
+    return {"job_id": job_id}
 
 @app.get("/progress/{job_id}")
 def progress(job_id: str):
@@ -250,4 +251,4 @@ def download(job_id: str):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "pipeline": "A+B auto highlight + subtitles"}
+    return {"status": "ok", "mode": "async"}
